@@ -64,8 +64,7 @@ async function runDeepL(text: string, targetLang: string): Promise<string | null
       result.data.translations &&
       result.data.translations.length > 0
     ) {
-      // 署名は削除しました（完成版）
-      return result.data.translations[0].text;
+      return result.data.translations[0].text + "\n\n[2026/1/15 VER]";
     }
   } catch (e) {
     logger.error('Failed to call DeepL API', e);
@@ -74,34 +73,135 @@ async function runDeepL(text: string, targetLang: string): Promise<string | null
 }
 
 // ---------------------------------------------------------------------------
+// 国旗emoji → DeepL言語コード変換マップ
+// ---------------------------------------------------------------------------
+
+const flagToLangCode: { [key: string]: string } = {
+  // 英語
+  'flag-us': 'EN-US',
+  'us': 'EN-US',
+  'flag-gb': 'EN-GB',
+  'gb': 'EN-GB',
+  'flag-au': 'EN-GB',
+  'flag-ca': 'EN-US',
+  // 日本語
+  'flag-jp': 'JA',
+  'jp': 'JA',
+  // 中国語（簡体字）
+  'flag-cn': 'ZH-HANS',
+  'cn': 'ZH-HANS',
+  // 中国語（繁体字）
+  'flag-tw': 'ZH-HANT',
+  'tw': 'ZH-HANT',
+  'flag-hk': 'ZH-HANT',
+  'hk': 'ZH-HANT',
+  // 韓国語
+  'flag-kr': 'KO',
+  'kr': 'KO',
+  // ドイツ語
+  'flag-de': 'DE',
+  'de': 'DE',
+  'flag-at': 'DE',
+  'flag-ch': 'DE',
+  // フランス語
+  'flag-fr': 'FR',
+  'fr': 'FR',
+  // スペイン語
+  'flag-es': 'ES',
+  'es': 'ES',
+  'flag-mx': 'ES',
+  // ポルトガル語
+  'flag-pt': 'PT-PT',
+  'pt': 'PT-PT',
+  'flag-br': 'PT-BR',
+  'br': 'PT-BR',
+  // イタリア語
+  'flag-it': 'IT',
+  'it': 'IT',
+  // オランダ語
+  'flag-nl': 'NL',
+  'nl': 'NL',
+  // ポーランド語
+  'flag-pl': 'PL',
+  'pl': 'PL',
+  // ロシア語
+  'flag-ru': 'RU',
+  'ru': 'RU',
+  // トルコ語
+  'flag-tr': 'TR',
+  'tr': 'TR',
+  // インドネシア語
+  'flag-id': 'ID',
+  'id': 'ID',
+  // ウクライナ語
+  'flag-ua': 'UK',
+  'ua': 'UK',
+  // スウェーデン語
+  'flag-se': 'SV',
+  'se': 'SV',
+  // デンマーク語
+  'flag-dk': 'DA',
+  'dk': 'DA',
+  // フィンランド語
+  'flag-fi': 'FI',
+  'fi': 'FI',
+  // ノルウェー語
+  'flag-no': 'NB',
+  'no': 'NB',
+  // チェコ語
+  'flag-cz': 'CS',
+  'cz': 'CS',
+  // ギリシャ語
+  'flag-gr': 'EL',
+  'gr': 'EL',
+  // ハンガリー語
+  'flag-hu': 'HU',
+  'hu': 'HU',
+  // ルーマニア語
+  'flag-ro': 'RO',
+  'ro': 'RO',
+  // ブルガリア語
+  'flag-bg': 'BG',
+  'bg': 'BG',
+  // スロバキア語
+  'flag-sk': 'SK',
+  'sk': 'SK',
+  // スロベニア語
+  'flag-si': 'SL',
+  'si': 'SL',
+  // エストニア語
+  'flag-ee': 'ET',
+  'ee': 'ET',
+  // ラトビア語
+  'flag-lv': 'LV',
+  'lv': 'LV',
+  // リトアニア語
+  'flag-lt': 'LT',
+  'lt': 'LT',
+  // アラビア語
+  'flag-sa': 'AR',
+  'sa': 'AR',
+  'flag-ae': 'AR',
+  'ae': 'AR',
+};
+
+// ---------------------------------------------------------------------------
 // Slack App Logic
 // ---------------------------------------------------------------------------
 
 // 1. Emoji Reaction -> Translate
 app.event('reaction_added', async ({ event, client, logger }) => {
   if (event.item.type === 'message') {
-    // 翻訳先の言語コード判定
-    let lang = '';
     const reactionName = event.reaction;
-    if (reactionName.match(/QP/i)) { return; } // ignore custom emojis
-    
-    // 特殊な言語コードのマッピングを追加
-    if (reactionName === 'flag-cn' || reactionName === 'cn') {
-      lang = 'ZH'; // 中国語
-    } else if (reactionName === 'flag-kr' || reactionName === 'kr') {
-      lang = 'KO'; // 韓国語
-    } else if (reactionName === 'flag-us' || reactionName === 'us' || reactionName === 'flag-gb' || reactionName === 'gb') {
-      lang = 'EN-US';
-    } else if (reactionName === 'flag-jp' || reactionName === 'jp') {
-      lang = 'JA';
-    } else if (reactionName.match(/flag-/)) {
-      lang = reactionName.replace('flag-', '').toUpperCase();
-    } else if (reactionName.match(/^[a-z]{2}$/)) {
-      lang = reactionName.toUpperCase();
-    }
 
+    // カスタム絵文字は無視
+    if (reactionName.match(/QP/i)) { return; }
+
+    // マップから言語コードを取得
+    let lang = flagToLangCode[reactionName];
+
+    // マップにない場合は無視
     if (!lang) {
-      // 言語フラグでないリアクションは無視
       return;
     }
 
@@ -159,7 +259,7 @@ app.shortcut('deepl-translation', async ({ ack, body, client }) => {
           element: {
             type: 'plain_text_input',
             action_id: 'lang',
-            placeholder: { type: 'plain_text', text: 'Language code (e.g. EN, JA)' },
+            placeholder: { type: 'plain_text', text: 'Language code (e.g. EN, JA, ZH)' },
             initial_value: 'EN',
           },
           label: { type: 'plain_text', text: 'Target Language' },
