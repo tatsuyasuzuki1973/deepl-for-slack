@@ -1,122 +1,188 @@
-import { loadEnv } from "./dotenv";
-loadEnv();
+import { App, ExpressReceiver } from '@slack/bolt';
+import { ConsoleLogger, LogLevel } from '@slack/logger';
+import axios from 'axios';
+import * as dotenv from 'dotenv';
 
-import { App } from "@slack/bolt";
-import { ConsoleLogger, LogLevel } from "@slack/logger";
-import * as middleware from "./custom-middleware";
+dotenv.config();
 
-import { DeepLApi } from "./deepl";
-import * as runner from "./runnner";
-import * as reacjilator from "./reacjilator";
-
-const logLevel = (process.env.SLACK_LOG_LEVEL as LogLevel) || LogLevel.INFO;
+const logLevel = process.env.SLACK_LOG_LEVEL === 'debug' ? LogLevel.DEBUG : LogLevel.INFO;
 const logger = new ConsoleLogger();
 logger.setLevel(logLevel);
 
-const deepLAuthKey = process.env.DEEPL_AUTH_KEY;
-if (!deepLAuthKey) {
-  throw "DEEPL_AUTH_KEY is missing!";
-}
-const deepL = new DeepLApi(deepLAuthKey, logger);
+const receiver = new ExpressReceiver({
+  signingSecret: process.env.SLACK_SIGNING_SECRET!,
+  clientId: process.env.SLACK_CLIENT_ID,
+  clientSecret: process.env.SLACK_CLIENT_SECRET,
+  stateSecret: process.env.SLACK_STATE_SECRET,
+  scopes: ['commands', 'chat:write', 'reactions:read'],
+  logLevel,
+  processBeforeResponse: true,
+});
 
 const app = new App({
+  token: process.env.SLACK_BOT_TOKEN,
+  receiver,
   logLevel,
-  logger,
-  token: process.env.SLACK_BOT_TOKEN!!,
-  signingSecret: process.env.SLACK_SIGNING_SECRET!!,
-  deferInitialization: true,
-});
-middleware.enableAll(app);
-
-// -----------------------------
-// shortcut
-// -----------------------------
-
-app.shortcut("deepl-translation", async ({ ack, body, client }) => {
-  await ack();
-  await runner.openModal(client, body.trigger_id);
 });
 
-app.view("run-translation", async ({ ack, client, body }) => {
-  const text = body.view.state.values.text.a.value!;
-  const lang = body.view.state.values.lang.a.selected_option!.value;
+// ---------------------------------------------------------------------------
+// DeepL API Logic
+// ---------------------------------------------------------------------------
 
-  await ack({
-    response_action: "update",
-    view: runner.buildLoadingView(lang, text),
-  });
+interface DeepLTranslationResponse {
+  translations: {
+    detected_source_language: string;
+    text: string;
+  }[];
+}
 
-  const translatedText: string | null = await deepL.translate(text, lang);
+async function runDeepL(text: string, targetLang: string): Promise<string | null> {
+  // FreeプランかProプランかでURLを切り替え
+  const isFreePlan = process.env.DEEPL_FREE_API_PLAN === '1';
+  const apiUrl = isFreePlan
+    ? 'https://api-free.deepl.com/v2/translate'
+    : 'https://api.deepl.com/v2/translate';
 
-  await client.views.update({
-    view_id: body.view.id,
-    view: runner.buildResultView(
-      lang,
-      text,
-      translatedText || ":x: Failed to translate it for some reason"
-    ),
-  });
-});
-
-app.view("new-runner", async ({ body, ack }) => {
-  await ack({
-    response_action: "update",
-    view: runner.buildNewModal(body.view.private_metadata),
-  });
-});
-
-// -----------------------------
-// reacjilator
-// -----------------------------
-
-import { ReactionAddedEvent } from "./types/reaction-added";
-
-app.event("reaction_added", async ({ body, client }) => {
-  const event = body.event as ReactionAddedEvent;
-  if (event.item["type"] !== "message") {
-    return;
-  }
-  const channelId = event.item["channel"];
-  const messageTs = event.item["ts"];
-  if (!channelId || !messageTs) {
-    return;
-  }
-  const lang = reacjilator.lang(event);
-  if (!lang) {
-    return;
-  }
-
-  const replies = await reacjilator.repliesInThread(
-    client,
-    channelId,
-    messageTs
-  );
-  if (replies.messages && replies.messages.length > 0) {
-    const message = replies.messages[0];
-    if (message.text) {
-      const translatedText = await deepL.translate(message.text, lang);
-      if (translatedText == null) {
-        return;
+  try {
+    // 2026/1/15以降の新認証方式: Authorization ヘッダー + JSON形式
+    const result = await axios.post<DeepLTranslationResponse>(
+      apiUrl,
+      {
+        text: [text],
+        target_lang: targetLang,
+      },
+      {
+        headers: {
+          'Authorization': `DeepL-Auth-Key ${process.env.DEEPL_AUTH_KEY}`,
+          'Content-Type': 'application/json'
+        }
       }
-      if (reacjilator.isAlreadyPosted(replies, translatedText)) {
-        return;
+    );
+
+    if (
+      result.data &&
+      result.data.translations &&
+      result.data.translations.length > 0
+    ) {
+      return result.data.translations[0].text + "\n\n[2026/1/15 VER]";
+    }
+  } catch (e) {
+    logger.error('Failed to call DeepL API', e);
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Slack App Logic
+// ---------------------------------------------------------------------------
+
+// 1. Emoji Reaction -> Translate
+app.event('reaction_added', async ({ event, client, logger }) => {
+  if (event.item.type === 'message') {
+    // 翻訳先の言語コード判定
+    let lang = '';
+    const reactionName = event.reaction;
+    if (reactionName.match(/QP/i)) { return; } // ignore custom emojis
+    if (reactionName === 'flag-us' || reactionName === 'us' || reactionName === 'flag-gb' || reactionName === 'gb') {
+      lang = 'EN-US';
+    } else if (reactionName === 'flag-jp' || reactionName === 'jp') {
+      lang = 'JA';
+    } else if (reactionName.match(/flag-/)) {
+      lang = reactionName.replace('flag-', '').toUpperCase();
+    } else if (reactionName.match(/^[a-z]{2}$/)) {
+      lang = reactionName.toUpperCase();
+    }
+
+    if (!lang) {
+      // 言語フラグでないリアクションは無視
+      return;
+    }
+
+    // リアクションされたメッセージを取得
+    const replies = await client.conversations.replies({
+      channel: event.item.channel,
+      ts: event.item.ts,
+      inclusive: true,
+    });
+
+    if (replies.messages && replies.messages.length > 0) {
+      const message = replies.messages[0];
+      if (message.text) {
+        // DeepL API呼び出し
+        const translatedText = await runDeepL(message.text, lang);
+        if (translatedText) {
+          // スレッドに翻訳結果を投稿
+          await client.chat.postMessage({
+            channel: event.item.channel,
+            thread_ts: event.item.ts,
+            text: translatedText,
+          });
+        }
       }
-      await reacjilator.sayInThread(client, channelId, translatedText, message);
     }
   }
 });
 
-// -----------------------------
-// starting the app
-// -----------------------------
+// 2. Shortcut -> Translate Modal
+app.shortcut('deepl-translation', async ({ ack, body, client }) => {
+  await ack();
+  await client.views.open({
+    trigger_id: body.trigger_id,
+    view: {
+      type: 'modal',
+      callback_id: 'deepl-modal',
+      title: { type: 'plain_text', text: 'DeepL Translate' },
+      submit: { type: 'plain_text', text: 'Translate' },
+      close: { type: 'plain_text', text: 'Close' },
+      blocks: [
+        {
+          type: 'input',
+          block_id: 'text-block',
+          element: {
+            type: 'plain_text_input',
+            action_id: 'text',
+            multiline: true,
+            placeholder: { type: 'plain_text', text: 'Text to translate' },
+          },
+          label: { type: 'plain_text', text: 'Text' },
+        },
+        {
+          type: 'input',
+          block_id: 'lang-block',
+          element: {
+            type: 'plain_text_input',
+            action_id: 'lang',
+            placeholder: { type: 'plain_text', text: 'Language code (e.g. EN, JA)' },
+            initial_value: 'EN',
+          },
+          label: { type: 'plain_text', text: 'Target Language' },
+        },
+      ],
+    },
+  });
+});
+
+app.view('deepl-modal', async ({ ack, view, client, body }) => {
+  await ack();
+  const text = view.state.values['text-block']['text'].value;
+  const lang = view.state.values['lang-block']['lang'].value;
+  if (text && lang) {
+    const translatedText = await runDeepL(text, lang);
+    if (translatedText) {
+      // モーダルを開いたユーザーへDMで結果を通知
+      await client.chat.postMessage({
+        channel: body.user.id,
+        text: `Translating "${text}" to ${lang}...\n\n> ${translatedText}`,
+      });
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Start the App
+// ---------------------------------------------------------------------------
 
 (async () => {
-  try {
-    await app.init();
-    await app.start(Number(process.env.PORT) || 3000);
-    console.log("⚡️ Bolt app is running!");
-  } catch (e) {
-    console.log(e);
-    process.exit(1);
-  }
+  await app.start(process.env.PORT || 3000);
+  console.log('⚡️ DeepL for Slack app is running!');
 })();
