@@ -64,7 +64,8 @@ async function runDeepL(text: string, targetLang: string): Promise<string | null
       result.data.translations &&
       result.data.translations.length > 0
     ) {
-      return result.data.translations[0].text + "\n\n[2026/1/15 VER]";
+      // 署名は削除しました（完成版）
+      return result.data.translations[0].text;
     }
   } catch (e) {
     logger.error('Failed to call DeepL API', e);
@@ -83,7 +84,13 @@ app.event('reaction_added', async ({ event, client, logger }) => {
     let lang = '';
     const reactionName = event.reaction;
     if (reactionName.match(/QP/i)) { return; } // ignore custom emojis
-    if (reactionName === 'flag-us' || reactionName === 'us' || reactionName === 'flag-gb' || reactionName === 'gb') {
+    
+    // 特殊な言語コードのマッピングを追加
+    if (reactionName === 'flag-cn' || reactionName === 'cn') {
+      lang = 'ZH'; // 中国語
+    } else if (reactionName === 'flag-kr' || reactionName === 'kr') {
+      lang = 'KO'; // 韓国語
+    } else if (reactionName === 'flag-us' || reactionName === 'us' || reactionName === 'flag-gb' || reactionName === 'gb') {
       lang = 'EN-US';
     } else if (reactionName === 'flag-jp' || reactionName === 'jp') {
       lang = 'JA';
